@@ -5,8 +5,8 @@ A **reusable accelerator** that embeds a **Power BI report** side-by-side with a
 "App Owns Data" pattern where end users are **not** authenticated against
 Entra ID.
 
-Plug in **your own** Power BI report, schema, and RLS model — no code changes
-required.
+Run `setup.py` once and it auto-discovers your schema and RLS model — **no code
+changes required**.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -44,6 +44,7 @@ required.
 | **AI Chatbot** | Azure OpenAI generates DAX from natural language |
 | **RLS in Chat** | Every DAX query is wrapped with the user's RLS filter — enforced server-side |
 | **Config-driven RLS** | Point `rls_config.json` at *your* identity & filter tables — no code changes |
+| **Auto-setup** | `setup.py` discovers your schema, detects RLS roles, and writes config files |
 | **Auth modes** | `azcli` (dev) or `ropc` (Master User — production) for DAX execution |
 | **User simulation** | Dropdown to switch between demo users and see different RLS views |
 
@@ -55,9 +56,10 @@ required.
 |-------------|-------|
 | **Azure AD App Registration** | Client secret; added to PBI workspace as Member+ |
 | **Power BI Premium / PPU / Fabric (F SKU)** | Required for `executeQueries` REST API |
-| **A published report with RLS** | Any model — you configure the mapping |
+| **A published report with RLS** | Any model — setup.py detects the mapping |
 | **Azure OpenAI resource** | GPT-4o / GPT-4.1-mini or similar deployment |
 | **Python 3.11+** | Backend runtime |
+| **Azure CLI** | `az login` for local dev (DAX auth). Not needed if using ROPC. |
 
 ---
 
@@ -76,32 +78,78 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env — fill in your Azure AD, Power BI, and OpenAI settings
 ```
 
-### 3. Run first-time setup
+Edit `.env` and fill in your values. The file is organized into sections:
+
+| Section | Variables | Where to find them |
+|---------|----------|--------------------|
+| **Service Principal** | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Entra ID → App Registrations |
+| **Power BI** | `PBI_WORKSPACE_ID`, `PBI_REPORT_ID`, `PBI_DATASET_ID`, `PBI_RLS_ROLE` | Power BI service URL or REST API |
+| **DAX Auth** | `DAX_AUTH_MODE` (`azcli` or `ropc`) | See [DAX Execution Auth](#dax-execution-auth--why-not-service-principal) |
+| **ROPC** *(optional)* | `DAX_USER_EMAIL`, `DAX_USER_PASSWORD` | Only when `DAX_AUTH_MODE=ropc` |
+| **Azure OpenAI** | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, etc. | Azure Portal → OpenAI resource |
+| **App** | `APP_SECRET_KEY`, `DEMO_USERS` | Generate a random key; set demo user map |
+
+> **Tip:** `AZURE_OPENAI_API_KEY` can be left blank if `DefaultAzureCredential`
+> has the **Cognitive Services OpenAI User** role on the resource.
+
+### 3. Login to Azure (for local dev)
+
+```bash
+az login
+```
+
+This provides the delegated token needed for DAX execution. Skip if using
+`DAX_AUTH_MODE=ropc`.
+
+### 4. Run first-time setup
 
 ```bash
 python setup.py
 ```
 
-This automatically:
-- **Discovers your dataset schema** (tables, columns, measures) via DAX
-- **Detects your RLS model** from the Power BI model definition (TMDL)
-- Falls back to smart heuristics if TMDL isn't available
-- Writes `sample_report/schema.json` and `rls_config.json`
+`setup.py` does **three things**:
 
-Use `--auto` to skip prompts and accept best-guess defaults:
+1. **Discovers your dataset schema** — Runs `COLUMNSTATISTICS()` and
+   `INFO.MEASURES()` DAX queries to enumerate all tables, columns, and
+   measures. Hidden system tables (`DateTableTemplate_*`, `LocalDateTable_*`)
+   are automatically filtered out.
+
+2. **Detects your RLS model** — Fetches the semantic model definition via
+   the Fabric `getDefinition` API (TMDL format). It parses:
+   - **Role definitions** — finds the identity table + column (e.g.
+     `Users[UPN]`) from filter expressions like `[UPN] == USERNAME()`
+   - **Relationships** — walks the relationship graph (BFS) from the identity
+     table to find the best filter target (the table/column RLS should filter
+     on)
+   - Falls back to **schema heuristics** if TMDL isn't available (e.g. non-
+     Fabric workspaces)
+
+3. **Writes config files**:
+   - `sample_report/schema.json` — dataset schema for the LLM
+   - `rls_config.json` — RLS identity + filter mapping
+
+**Modes:**
+
+| Flag | Behaviour |
+|------|-----------|
+| *(none)* | Interactive — auto-detects then asks you to confirm or adjust |
+| `--auto` | Fully automatic — accepts best-guess defaults, no prompts |
 
 ```bash
+# Interactive (recommended for first run)
+python setup.py
+
+# Fully automatic
 python setup.py --auto
 ```
 
-> **Manual alternative:** You can also create these files by hand — see
-> [RLS Configuration](#rls-configuration) and [Schema File](#schema-file)
-> sections below.
+> **Manual alternative:** You can create `rls_config.json` and
+> `sample_report/schema.json` by hand — see [RLS Configuration](#rls-configuration)
+> and [Schema File](#schema-file) below.
 
-### 4. Run
+### 5. Run
 
 ```bash
 uvicorn app:app --reload --port 8000
@@ -111,11 +159,49 @@ Open **http://localhost:8000** — select a demo user from the dropdown.
 
 ---
 
+## What `setup.py` Does
+
+```
+python setup.py
+  │
+  ├─ 1. Acquires tokens
+  │     ├── Service Principal token (Power BI scope)
+  │     ├── Service Principal token (Fabric scope)
+  │     └── DAX token (az cli or ROPC)
+  │
+  ├─ 2. Discovers schema via DAX
+  │     ├── EVALUATE COLUMNSTATISTICS()        → tables + columns
+  │     ├── SELECT * FROM $SYSTEM.TMSCHEMA_MEASURES → measures  (DMV)
+  │     ├── Filters hidden system tables
+  │     └── Writes sample_report/schema.json
+  │
+  ├─ 3. Detects RLS configuration
+  │     ├── Fetches TMDL via Fabric getDefinition API
+  │     │     ├── Parses role files → identity table/column
+  │     │     ├── Parses relationship files → builds graph
+  │     │     └── BFS from identity table → filter target
+  │     │
+  │     ├── (fallback) Heuristic detection
+  │     │     ├── Matches table/column names against known patterns
+  │     │     └── Scores candidates (UPN, Email, UserName, etc.)
+  │     │
+  │     └── Writes rls_config.json
+  │
+  └─ Done! → "Run: uvicorn app:app --reload --port 8000"
+```
+
+If you change your Power BI model (add tables, modify RLS), just re-run
+`setup.py` to regenerate the config files.
+
+---
+
 ## RLS Configuration
 
 The file **`rls_config.json`** tells the accelerator how to enforce RLS on
-DAX chat queries. This is the **only file you need to change** to adapt to
-any RLS model.
+DAX chat queries. `setup.py` generates this automatically, but you can also
+create or edit it by hand.
+
+A template is provided in **`rls_config.example.json`**.
 
 ```jsonc
 {
@@ -198,7 +284,8 @@ still enforce RLS via the embed token, but chat queries will run unfiltered.
 
 ## Schema File
 
-Place your dataset schema at **`sample_report/schema.json`**:
+**`sample_report/schema.json`** is generated by `setup.py`. It tells the LLM
+what tables, columns, and measures exist so it can write correct DAX.
 
 ```json
 {
@@ -217,19 +304,20 @@ Place your dataset schema at **`sample_report/schema.json`**:
 }
 ```
 
-This is fed to the LLM so it knows what tables/columns/measures exist.
-You can generate it from your TMDL, BIM file, or manually.
+`setup.py` auto-discovers this via DAX queries (`COLUMNSTATISTICS()` and
+`INFO.MEASURES()`) and filters out hidden system tables. You can also create
+or edit it manually.
 
-> **Tip:** If you skip this file, the server will try to auto-discover the
-> schema via DAX `COLUMNSTATISTICS()` and `INFO.MEASURES()`, but a static
-> file is more reliable.
+> **Tip:** Re-run `setup.py` whenever your Power BI model changes (new tables,
+> renamed columns, etc.) to keep the schema in sync.
 
 ---
 
 ## DAX Execution Auth — Why Not Service Principal?
 
 The Power BI `executeQueries` REST API requires **`Dataset.ReadWrite.All`** —
-a **delegated-only** permission (it requires a user context).
+a **delegated-only** permission (it requires a user context). This is a
+universal limitation across all tenants.
 
 | Auth Method | Token Type | `executeQueries` | Why |
 |-------------|-----------|-------------------|-----|
@@ -243,13 +331,48 @@ a **delegated-only** permission (it requires a user context).
 
 | Mode | Setting | When to use |
 |------|---------|-------------|
-| `azcli` | Default | Local development (`az login` as a Power BI admin) |
-| `ropc` | `DAX_AUTH_MODE=ropc` | Production / CI. Set `DAX_USER_EMAIL` and `DAX_USER_PASSWORD`. Account must not have MFA. App registration must enable "Allow public client flows". |
+| `azcli` | `DAX_AUTH_MODE=azcli` (default) | Local development — requires `az login` as a Power BI admin |
+| `ropc` | `DAX_AUTH_MODE=ropc` | Production / CI — set `DAX_USER_EMAIL` and `DAX_USER_PASSWORD` |
 
-**On-Behalf-Of (OBO)** is the most secure production option but requires
-replacing the demo user dropdown with real Entra ID authentication. The
-`executeQueries` call would use the real user's exchanged token, eliminating
-the need for a stored password.
+#### ROPC setup
+
+1. Set `DAX_AUTH_MODE=ropc` in `.env`
+2. Uncomment and fill in `DAX_USER_EMAIL` and `DAX_USER_PASSWORD`
+3. The service account must **not** have MFA enabled
+4. The app registration must allow public client flows:
+   Portal → App Registration → Authentication → Advanced → Allow public client flows → **Yes**
+
+#### On-Behalf-Of (recommended for production)
+
+**OBO** is the most secure production option but requires replacing the demo
+user dropdown with real Entra ID authentication. The `executeQueries` call
+would use the real user's exchanged token, eliminating the need for a stored
+password. (Not implemented in this accelerator — intended as a next step.)
+
+---
+
+## Environment Variables Reference
+
+All settings live in `.env` (copied from `.env.example`):
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AZURE_TENANT_ID` | Yes | — | Entra ID tenant ID |
+| `AZURE_CLIENT_ID` | Yes | — | App registration client ID |
+| `AZURE_CLIENT_SECRET` | Yes | — | App registration client secret |
+| `PBI_WORKSPACE_ID` | Yes | — | Power BI workspace GUID |
+| `PBI_REPORT_ID` | Yes | — | Power BI report GUID |
+| `PBI_DATASET_ID` | Yes | — | Power BI dataset (semantic model) GUID |
+| `PBI_RLS_ROLE` | Yes | `ViewerRole` | RLS role name (case-sensitive) |
+| `DAX_AUTH_MODE` | No | `azcli` | `azcli` or `ropc` |
+| `DAX_USER_EMAIL` | ROPC only | — | Service account email |
+| `DAX_USER_PASSWORD` | ROPC only | — | Service account password |
+| `AZURE_OPENAI_ENDPOINT` | Yes | — | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_API_KEY` | No | — | API key (blank = use DefaultAzureCredential) |
+| `AZURE_OPENAI_DEPLOYMENT` | Yes | `gpt-4o` | Model deployment name |
+| `AZURE_OPENAI_API_VERSION` | No | `2024-12-01-preview` | API version |
+| `APP_SECRET_KEY` | Yes | — | Random string for session signing |
+| `DEMO_USERS` | Yes | — | JSON map: `{"Display Name":"upn@domain.com"}` |
 
 ---
 
@@ -257,22 +380,22 @@ the need for a stored password.
 
 ```
 powerbi-rls-chatbot/
-├── app.py                   # FastAPI routes
+├── app.py                   # FastAPI routes (embed token, chat, health)
 ├── config.py                # Settings from .env + rls_config.json loader
 ├── powerbi_service.py       # PBI REST API: tokens, DAX execution, RLS wrapping
 ├── chat_engine.py           # LLM orchestrator: NL → DAX → RLS → answer
-├── setup.py                 # ← Run once to auto-discover schema + RLS config
+├── setup.py                 # First-time setup: auto-discover schema + RLS
 ├── rls_config.json          # RLS configuration (generated by setup.py)
 ├── rls_config.example.json  # Template for rls_config.json
 ├── requirements.txt         # Python dependencies
 ├── .env                     # Secrets & IDs (git-ignored)
-├── .env.example             # Template for .env
+├── .env.example             # Documented template for .env
 ├── Dockerfile               # Container build
 ├── templates/
 │   └── index.html           # Jinja2 page template
 ├── static/
 │   ├── css/styles.css       # UI styles
-│   └── js/app.js            # Frontend logic
+│   └── js/app.js            # Frontend logic (PBI embed + chat)
 └── sample_report/
     └── schema.json          # Dataset schema (generated by setup.py)
 ```
@@ -295,10 +418,11 @@ User selects "Alice" → POST /api/embed-token { rls_username: "alice@contoso.co
 ```
 Alice asks "What were total sales by region?"
   → POST /api/chat { message, rls_username: "alice@contoso.com" }
-  → Server loads schema + RLS config
+  → Server loads schema.json + rls_config.json
   → LLM generates DAX: EVALUATE SUMMARIZECOLUMNS(...)
-  → Server wraps with CALCULATETABLE + TREATAS({"West"}, ...)
-  → Calls executeQueries with delegated token (no impersonation needed)
+  → Server looks up Alice's allowed values: ["West"]
+  → Server wraps DAX: CALCULATETABLE(<query>, TREATAS({"West"}, ...))
+  → Calls executeQueries with delegated token
   → Results: [{ Region: "West", Total: 4050 }]  ← RLS applied!
   → LLM summarises: "Your total sales were $4,050, all in the West region."
 ```
@@ -318,15 +442,29 @@ Alice asks "What were total sales by region?"
 
 ## Adapting to Your Report — Checklist
 
-1. **`.env`** — Set your tenant/client IDs, Power BI workspace/report/dataset
-   IDs, RLS role name, Azure OpenAI endpoint, and demo users.
-2. **`rls_config.json`** — Point at your identity table/column and filter
-   table/column. Add a description for the LLM.
-3. **`sample_report/schema.json`** — List your tables, columns, and measures.
-4. **`DAX_AUTH_MODE`** — Use `azcli` for dev, `ropc` for production.
-5. **Test** — Switch between demo users and verify each sees only their data.
+1. **`.env`** — Fill in your Azure AD, Power BI, and OpenAI settings
+   (copy from `.env.example`)
+2. **`az login`** — Sign in as a Power BI admin (or configure ROPC)
+3. **`python setup.py`** — Auto-generates `schema.json` and `rls_config.json`
+4. **Review** — Check the generated files; adjust if needed
+5. **`DEMO_USERS`** — Set demo user map in `.env` to match your RLS identities
+6. **Test** — Run `uvicorn app:app --reload --port 8000`, switch between users,
+   and verify each sees only their data
 
 No Python code changes required.
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `setup.py` — "401 Unauthorized" on schema discovery | DAX token doesn't have user context | Run `az login` (azcli) or configure ROPC credentials |
+| `setup.py` — "TMDL fetch failed" | Workspace isn't on Fabric (F SKU) | Expected — setup.py falls back to heuristics automatically |
+| `setup.py` — identity column is empty | Filter expression uses non-standard DAX | Edit `rls_config.json` manually after setup |
+| Chat returns unfiltered data | `rls_config.json` has `"enabled": false` or wrong table/column | Re-run `setup.py` or edit the file |
+| Embed token 403 | SP not added to workspace, or wrong workspace/report ID | Add SP as Member+ in PBI workspace settings |
+| DAX 401 | Using SP/MI for `executeQueries` | Switch to `azcli` or `ropc` — see [DAX Execution Auth](#dax-execution-auth--why-not-service-principal) |
 
 ---
 
@@ -350,7 +488,7 @@ No Python code changes required.
 | **DAX auth** | Use ROPC (Master User) or OBO for delegated tokens |
 | **Token caching** | MSAL handles SP token caching; consider caching embed tokens (TTL ~1 hr) |
 | **Rate limiting** | `executeQueries` is throttled; add server-side rate limits |
-| **Schema refresh** | Refresh `schema.json` when the model changes |
+| **Schema refresh** | Re-run `setup.py` when the Power BI model changes |
 | **Streaming** | Add SSE/WebSocket for streaming LLM responses |
 | **Monitoring** | Application Insights or equivalent |
 | **DAX validation** | Sanitise LLM-generated DAX before execution |
