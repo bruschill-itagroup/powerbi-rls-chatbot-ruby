@@ -4,8 +4,9 @@ require_relative 'config'
 require_relative 'powerbi_service'
 require_relative 'chat_engine'
 
-set :public_folder, 'static'
-set :views, 'templates'
+set :public_folder, File.join(File.dirname(__FILE__), 'static')
+set :static, true
+set :views, File.join(File.dirname(__FILE__), 'templates')
 
 # Sinatra doesn't have a direct equivalent to lifespan, but we can use before
 configure do
